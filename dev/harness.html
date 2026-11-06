@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>花笺 harness</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07080b; color: #ddd; font: 12px/1.5 system-ui, sans-serif; overflow: hidden; }
+  #stage { position: absolute; inset: 0; }
+  /* Stands in for the host background (Folia paints a blurred cover / gradient under every mode). */
+  #bg { position: absolute; inset: 0; background: radial-gradient(120% 90% at 30% 20%, #1c2433 0%, #0b0e14 55%, #050608 100%); }
+  body.day.day #bg { background: radial-gradient(120% 90% at 30% 20%, #f7f3ec 0%, #ece5d9 60%, #ddd4c5 100%); }
+  body.anthem #bg { background: radial-gradient(120% 90% at 70% 10%, #3a1c2a 0%, #160c14 55%, #07050a 100%); }
+  body.lanterns #bg { background: radial-gradient(120% 90% at 40% 30%, #2a1f14 0%, #100c08 60%, #050403 100%); }
+  #hud { position: absolute; right: 10px; top: 8px; color: rgba(255,255,255,.55); white-space: pre; z-index: 5; text-align: right; }
+  body.day #hud { color: rgba(0,0,0,.5); }
+  body.shot #hud { display: none; }
+</style>
+</head>
+<body>
+<div id="bg"></div>
+<div id="stage"></div>
+<div id="hud"></div>
+<script type="module">
+import { SONGS, fakeAiAnswer } from './fixtures.mjs';
+
+const params = new URLSearchParams(location.search);
+globalThis.__HUAJIAN_DEBUG__ = true;
+if (params.get('gctest') === '1') globalThis.__HUAJIAN_GC_TEST__ = true;
+// dpr=1.5 imitates a scaled display (Folia users on Windows often run 125–200 %).
+if (params.get('dpr')) Object.defineProperty(window, 'devicePixelRatio', { get: () => Number(params.get('dpr')) });
+const picked = SONGS[params.get('song') ?? 'ballad'];
+// ?rap=1: every line sung in 1.2 s, as dense as a rapped verse (for the 浮名 sheet).
+const fixture = params.get('rap') === '1' ? { ...picked, lines: picked.lines.map((line) => ({ ...line, endTime: line.startTime + 1.2, words: undefined })) } : picked;
+const day = params.get('day') === '1';
+const useAi = params.get('ai') !== '0';
+document.body.classList.toggle('day', day);
+document.body.classList.add(params.get('song') ?? 'ballad');
+if (params.get('shot') === '1') document.body.classList.add('shot');
+
+// ---------------------------------------------------------------- clock
+const clock = {
+  base: Number(params.get('t') ?? 0),
+  startedAt: performance.now(),
+  playing: params.get('play') === '1',
+  speed: Number(params.get('speed') ?? 1),
+  now() { return this.playing ? this.base + ((performance.now() - this.startedAt) / 1000) * this.speed : this.base; },
+  set(t) { this.base = t; this.startedAt = performance.now(); },
+  toggle() { this.set(this.now()); this.playing = !this.playing; },
+};
+window.__clock = clock;
+
+// ---------------------------------------------------------------- synthetic audio
+const beat = 60 / fixture.bpm;
+const spectrum = new Uint8Array(512);
+const bands = { bass: 0, lowMid: 0, mid: 0, vocal: 0, treble: 0 };
+const singing = (t) => fixture.lines.some((l) => t >= l.startTime && t <= l.endTime);
+const audio = {
+  getPower() { return this._p ?? 0; },
+  getBands() { return bands; },
+  getSpectrum() { return spectrum; },
+  tick(t) {
+    const phase = (t % beat) / beat;
+    const kick = Math.exp(-phase * 9);
+    const loud = fixture.ai.energy;
+    const voice = singing(t) ? 0.6 : 0.2;
+    this._p = 0.35 + 0.25 * loud + 0.15 * kick * loud;
+    bands.bass = 0.3 + 0.6 * kick * loud;
+    bands.lowMid = 0.35 + 0.2 * kick;
+    bands.mid = 0.3;
+    bands.vocal = voice;
+    bands.treble = 0.15 + 0.1 * loud;
+    for (let i = 0; i < spectrum.length; i += 1) spectrum[i] = i < 14 ? Math.round(255 * Math.min(1, 0.25 + 0.75 * kick * loud)) : Math.round(80 * Math.exp(-i / 90));
+  },
+};
+
+// ---------------------------------------------------------------- mock Folium
+const storage = new Map();
+const theme = day
+  ? { ...fixture.theme, primaryColor: '#1f1c19', accentColor: '#a3532d', secondaryColor: '#6b625a', backgroundColor: '#f3eee6', isDaylight: true }
+  : { ...fixture.theme };
+if (params.get('wc') === '1') theme.wordColors = [{ word: '雨停', color: '#8fb8ff' }, { word: '明天', color: '#ffd27a' }, { word: '向光', color: '#ff9f6b' }, { word: '烟花', color: '#ff7fb0' }, { word: 'light', color: '#ffd27a' }];
+const SANS = '"PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+const SERIF = '"Noto Serif SC", "Source Han Serif SC", "Songti SC", "STSong", "SimSun", serif';
+let section = null;
+let visualizer = null;
+const commands = {};
+const segmenter = new Intl.Segmenter('zh', { granularity: 'word' });
+const folium = {
+  modId: 'huajian',
+  host: { folium: { major: 1, minor: 7 }, folia: '0.7.23' },
+  env: { context: 'main' },
+  log: { info: (...a) => console.log('[info]', ...a), warn: (...a) => console.warn('[warn]', ...a), error: (...a) => console.error('[error]', ...a) },
+  registries: {
+    settingsSections: { register(def) {
+      const values = Object.fromEntries(def.settings.filter((s) => s.type !== 'secret').map((s) => [s.key, s.defaultValue]));
+      Object.assign(values, { provider: 'deepseek', model: useAi ? 'mock-model' : '', ai: useAi });
+      const listeners = new Set();
+      section = { settings: { schema: def.settings, get: () => values, set: (patch) => { Object.assign(values, patch); listeners.forEach((l) => l()); }, onChange: (l) => { listeners.add(l); return () => listeners.delete(l); } } };
+      return { ...section, unregister() {} };
+    } },
+    visualizers: { register(def) { visualizer = def; return { unregister() {} }; } },
+    commands: { register(def) { commands[def.id] = def; return { unregister() {} }; } },
+  },
+  storage: {
+    get: async (k) => (storage.has(k) ? structuredClone(storage.get(k)) : undefined),
+    set: async (k, v) => { storage.set(k, structuredClone(v)); },
+    has: async (k) => storage.has(k),
+    delete: async (k) => { storage.delete(k); },
+    keys: async () => [...storage.keys()],
+  },
+  secrets: { get: async () => 'sk-mock', has: async () => true, set: async () => {}, subscribe: () => () => {} },
+  net: {
+    async fetch(url, init) {
+      const body = JSON.parse(init.body ?? '{}');
+      const user = body.messages?.find((m) => m.role === 'user')?.content ?? '';
+      window.__lastPrompt = { system: body.messages?.[0]?.content, user };
+      await new Promise((r) => setTimeout(r, Number(params.get('aiDelay') ?? 1200)));
+      const answer = fakeAiAnswer(fixture, user);
+      const json = { choices: [{ message: { content: JSON.stringify(answer) }, finish_reason: 'stop' }], usage: { prompt_tokens: 1800, completion_tokens: 420 } };
+      return { ok: true, status: 200, statusText: 'OK', headers: {}, text: () => JSON.stringify(json), json: () => json };
+    },
+  },
+  playback: { getState: () => ({ song: fixture.song }), getQueue: () => ({ kind: 'queue', currentIndex: -1, length: 0, items: [] }), getLoopMode: () => 'off' },
+  lyrics: {
+    segmentWords: (line) => [...segmenter.segment(line.fullText)].map((s) => ({ segment: s.segment, index: s.index, isWordLike: Boolean(s.isWordLike) })),
+    // Stand-in for the host's matcher: every occurrence of each word, longer words first, no overlaps.
+    buildWordColorRanges(fullText, wordColors) {
+      const ranges = [];
+      for (const { word, color } of [...(wordColors ?? [])].sort((a, b) => b.word.length - a.word.length)) {
+        for (let at = fullText.indexOf(word); at >= 0 && word; at = fullText.indexOf(word, at + word.length)) {
+          if (!ranges.some((r) => at < r.endOffset && at + word.length > r.startOffset)) ranges.push({ startOffset: at, endOffset: at + word.length, color, priority: word.length });
+        }
+      }
+      return ranges.sort((a, b) => a.startOffset - b.startOffset);
+    },
+  },
+  theme: { resolveFontStack: (t) => (t.fontStyle === 'serif' ? SERIF : SANS), resolveFontWeight: (t, fallback) => t?.fontWeight ?? fallback },
+  // Stand-in online sources for the evaluator: every search finds "the song", and its lyric is the
+  // fixture closest to its band (instrumental for the instrumental band).
+  omni: {
+    async searchSongs(query) { return { items: [{ id: query, title: query, artist: query, source: 'mock', ref: 'mock' }] }; },
+    async getLyrics(song) {
+      const { EVAL_SET } = await import('../src/eval-set.mjs');
+      const item = EVAL_SET.find((entry) => song.title === `${entry.title} ${entry.artist}`);
+      if (item?.instrumental) return { lines: [], isPureMusic: true };
+      const pick = { sad: 'ballad', tender: 'lanterns', darkFast: 'ballad', hype: 'anthem', rap: 'anthem', bright: 'anthem' }[item?.band] ?? 'lanterns';
+      return { lines: SONGS[pick].lines, isPureMusic: false };
+    },
+  },
+  ui: { toast: (m) => console.log('[toast]', m) },
+  experimental: {},
+};
+
+// cached=1 (default with AI): the direction is already in the data file, as for a song heard before.
+if (useAi && params.get('cached') !== '0') {
+  const { analyzeLyrics, lyricFingerprint } = await import('../src/lyrics.mjs');
+  const { buildPrompt, validateDirection } = await import('../src/direction.mjs');
+  const analysis = analyzeLyrics(fixture.lines);
+  const { user } = buildPrompt({ analysis, song: fixture.song, theme, duration: fixture.duration });
+  storage.set(`dir:fixture:${fixture.song.id}`, { fp: lyricFingerprint(analysis), d: validateDirection(fakeAiAnswer(fixture, user), analysis), at: Date.now() });
+}
+
+const { default: activate } = await import(`../huajian/client.mjs?v=${Date.now()}`);
+await activate(folium);
+
+// ---------------------------------------------------------------- mock stage context
+const visualValues = Object.fromEntries(visualizer.settings.map((s) => [s.key, s.defaultValue]));
+for (const [key, value] of params) if (key in visualValues) visualValues[key] = typeof visualValues[key] === 'number' ? Number(value) : typeof visualValues[key] === 'boolean' ? value === '1' : value;
+const container = document.getElementById('stage');
+const changeListeners = new Set();
+const display = { showText: true, lyricsFontScale: 1, visualizerOpacity: 1 };
+window.__setShowText = (on) => { display.showText = on; changeListeners.forEach((l) => l()); };
+const lineIndexAt = (t) => fixture.lines.findIndex((l) => t >= l.startTime && t <= l.renderHints.renderEndTime);
+const ctx = {
+  lines: fixture.lines,
+  song: fixture.song,
+  staticMode: params.get('static') === '1',
+  staticLineIndex: params.get('static') === '1' ? Number(params.get('line') ?? 4) : null,
+  seed: fixture.song.id,
+  isPreview: false,
+  // coarse=0.25 imitates an audio clock that only advances in steps (plus a little jitter).
+  lyricTime: { get: () => { const step = Number(params.get('coarse') ?? 0); const t = clock.now(); return step > 0 ? Math.floor(t / step) * step + Math.random() * 0.01 : t; } },
+  getDuration: () => fixture.duration,
+  getLineIndex: () => lineIndexAt(clock.now()),
+  isPaused: () => !clock.playing,
+  getTheme: () => theme,
+  getSubtitleTheme: () => theme,
+  getCoverUrl: () => null,
+  getDisplay: () => display,
+  getSettings: () => visualValues,
+  getSurface: () => ({ transparent: false, hostBackground: true }),
+  getLayout: () => null,
+  audio,
+  onChange: (l) => { changeListeners.add(l); return () => changeListeners.delete(l); },
+  // timer=1 drives frames from a 60 Hz timer: Windows throttles animation frames of a covered window to 1 Hz.
+  onFrame: (l) => {
+    let id = 0;
+    const timer = params.get('timer') === '1';
+    const loop = (ts) => { audio.tick(clock.now()); l(ts ?? performance.now()); id = timer ? setTimeout(loop, 16) : requestAnimationFrame(loop); };
+    id = timer ? setTimeout(loop, 16) : requestAnimationFrame(loop);
+    return () => (timer ? clearTimeout(id) : cancelAnimationFrame(id));
+  },
+  onResize: (l) => { const ro = new ResizeObserver(() => l({ width: container.clientWidth, height: container.clientHeight })); ro.observe(container); return () => ro.disconnect(); },
+  every: (ms, l) => { const id = setInterval(l, ms); return () => clearInterval(id); },
+  onDispose: () => {},
+  onLyricTime: () => () => {},
+};
+let dispose = visualizer.mount(container, ctx);
+window.__ready = false;
+setTimeout(() => { window.__ready = true; }, Number(params.get('settle') ?? 400));
+
+// ---------------------------------------------------------------- controls
+const hud = document.getElementById('hud');
+setInterval(() => {
+  hud.textContent = `${fixture.song.title}  ${clock.now().toFixed(2)} s  ${clock.playing ? '▶' : '❚❚'}\nspace 播放/暂停 · ←/→ ±5 s · [ ] ±0.5 s`;
+}, 200);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space') clock.toggle();
+  if (e.code === 'ArrowRight') clock.set(clock.now() + 5);
+  if (e.code === 'ArrowLeft') clock.set(Math.max(0, clock.now() - 5));
+  if (e.key === ']') clock.set(clock.now() + 0.5);
+  if (e.key === '[') clock.set(Math.max(0, clock.now() - 0.5));
+});
+window.__seek = (t) => clock.set(t);
+window.__commands = commands;
+window.__storage = storage;
+window.__section = section;
+window.__remount = () => { dispose?.(); dispose = visualizer.mount(container, ctx); };
+// Fires the host's change notification, as Folia does for line, theme, display and settings changes.
+window.__notify = () => changeListeners.forEach((l) => l());
+window.__setTheme = (patch) => { Object.assign(theme, patch); window.__notify(); };
+// A second, preview-style mount (as Folia's mode picker shows), torn down after `ms`.
+window.__previewMount = (ms) => {
+  const box = document.createElement('div');
+  box.style.cssText = 'position:absolute;right:10px;bottom:10px;width:320px;height:180px;';
+  document.body.appendChild(box);
+  const pctx = { ...ctx, isPreview: true, staticMode: true, staticLineIndex: 6, onChange: () => () => {}, onFrame: ctx.onFrame, onResize: (l) => { l({ width: 320, height: 180 }); return () => {}; } };
+  const off = visualizer.mount(box, pctx);
+  setTimeout(() => { off?.(); box.remove(); }, ms);
+};
+window.__fuzz = async (seconds) => {
+  const errors = [];
+  addEventListener('error', (e) => errors.push(String(e.error?.stack ?? e.message).slice(0, 1500)));
+  const origError = console.error;
+  console.error = (...a) => { errors.push(a.map((x) => (x && typeof x === 'object' && !(x instanceof Error) ? JSON.stringify(x) : String(x?.stack ?? x))).join(' ').slice(0, 1500)); origError(...a); };
+  const actions = [
+    ['seek', () => window.__seek(Math.random() * fixture.duration)],
+    ['seekNear', () => window.__seek(Math.max(0, clock.now() + (Math.random() - 0.5) * 6))],
+    ['pause', () => clock.toggle()],
+    ['theme', () => window.__setTheme({ accentColor: Math.random() < 0.5 ? '#ffb35c' : '#7fd6ff' })],
+    ['day', () => window.__setTheme({ isDaylight: Math.random() < 0.3 })],
+    ['text', () => window.__setShowText(Math.random() < 0.7)],
+    ['notify', () => window.__notify()],
+    ['resize', () => { container.style.right = Math.random() < 0.5 ? '0px' : '120px'; }],
+    ['remount', () => window.__remount()],
+    ['preview', () => window.__previewMount(400 + Math.random() * 1500)],
+  ];
+  const log = [];
+  const end = performance.now() + seconds * 1000;
+  while (performance.now() < end) {
+    const [name, run] = actions[Math.floor(Math.random() * actions.length)];
+    log.push(name);
+    try { run(); } catch (e) { errors.push('action ' + name + ': ' + e.stack); }
+    await new Promise((r) => setTimeout(r, 150 + Math.random() * 650));
+  }
+  if (!clock.playing) clock.toggle();
+  return { errors, actions: log.length };
+};
+</script>
+</body>
+</html>
