@@ -83,7 +83,7 @@ export default async function activate(folium) {
       baseUrl: String(values.baseUrl ?? '').trim(),
       model: String(values.model ?? '').trim(),
       thinking: String(values.thinking ?? 'auto'),
-      temperature: Number(values.temperature ?? 0.5),
+      temperature: Number(values.temperature ?? 0.3),
     };
   };
 

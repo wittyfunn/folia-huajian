@@ -1,4 +1,4 @@
-// 花笺 1.0.0 — built from src/ by dev/build.mjs; edit src/, not this file.
+// 花笺 1.0.2 — built from src/ by dev/build.mjs; edit src/, not this file.
 // Source modules are kept in separate scopes below, in dependency order.
 import * as PIXI from './vendor/pixi.min.mjs';
 
@@ -7052,7 +7052,7 @@ export default async function activate(folium) {
       baseUrl: String(values.baseUrl ?? '').trim(),
       model: String(values.model ?? '').trim(),
       thinking: String(values.thinking ?? 'auto'),
-      temperature: Number(values.temperature ?? 0.5),
+      temperature: Number(values.temperature ?? 0.3),
     };
   };
 
